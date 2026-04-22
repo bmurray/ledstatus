@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "ledstatus hook thinking" }] }
+    ],
+    "PreToolUse": [
+      { "hooks": [{ "type": "command", "command": "ledstatus hook thinking" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "ledstatus hook thinking" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "ledstatus hook waiting_permission" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "ledstatus hook waiting_input" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "ledstatus hook off" }] }
+    ]
+  }
+}

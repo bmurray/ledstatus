@@ -1,0 +1,5 @@
+# Luxafor Flag (VID 04D8 PID F372).
+# World-writable on a personal machine — simpler and deterministic than
+# relying on systemd-logind uaccess ACLs, which sometimes don't get applied
+# to hidraw nodes even with TAG+="uaccess".
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="f372", MODE="0666"
