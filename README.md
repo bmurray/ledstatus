@@ -9,6 +9,8 @@ Drive a [Luxafor Flag](https://luxafor.com/) USB LED from Claude Code hooks so y
 
 Multiple concurrent Claude sessions are tracked separately, and the most urgent state wins (`waiting_permission` > `waiting_input` > `thinking`). A Claude chewing through a long tool loop won't stomp a different Claude that's waiting for you.
 
+For local sessions, the daemon watches Claude's PID and clears its LED the moment the process exits — no waiting on a TTL, and a Claude that's legitimately idle on `waiting_input` for hours keeps its light on.
+
 Pure Go, no cgo, no external Go dependencies.
 
 ---
@@ -17,16 +19,16 @@ Pure Go, no cgo, no external Go dependencies.
 
 Two small binaries:
 
-- **`ledstatusd`** — long-running daemon. Listens on a Unix socket (and optionally a TCP port for remote clients). Tracks each Claude session's last-reported state with a 5-minute TTL. An animator goroutine owns the `/dev/hidrawN` handle and renders the winning state at ~30fps.
-- **`ledstatus`** — tiny CLI. Wired into Claude Code hooks; reads the hook's JSON on stdin, extracts `session_id`, and fires a message to the daemon. Silent on connection failure so a down daemon never breaks a Claude turn.
+- **`ledstatusd`** — long-running daemon. Listens on a Unix socket (and optionally a TCP port for remote clients). Tracks each Claude session's last-reported state. Local sessions are evicted when Claude's PID exits; remote (TCP) sessions fall back to a 5-minute TTL. An animator goroutine owns the `/dev/hidrawN` handle and renders the winning state at ~30fps. With `--forward-to` it instead runs in *forwarder mode* — see [Remote / multi-machine](#remote--multi-machine).
+- **`ledstatus`** — tiny CLI. Wired into Claude Code hooks; reads the hook's JSON on stdin, extracts `session_id`, walks the process tree to find Claude's PID, and fires a message to the daemon. Silent on connection failure so a down daemon never breaks a Claude turn.
 
 Wire protocol is newline-delimited JSON:
 
 ```json
-{"claude_id": "abc-123", "state": "thinking", "cwd": "/home/me/project"}
+{"claude_id": "abc-123", "state": "thinking", "cwd": "/home/me/project", "claude_pid": 12345}
 ```
 
-States: `thinking`, `waiting_permission`, `waiting_input`, `off`.
+States: `thinking`, `waiting_permission`, `waiting_input`, `off`. `claude_pid` is optional — zero/absent means "no local PID info", and the daemon falls back to TTL reaping.
 
 ---
 
@@ -129,9 +131,10 @@ The daemon re-reads the config file on `SIGHUP` and swaps it in atomically.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--socket <path>` | `$XDG_RUNTIME_DIR/ledstatus.sock` | Unix socket path |
-| `--tcp-addr <host:port>` | *(disabled)* | Optional **unauthenticated** TCP listener. e.g. `:9876` |
-| `--ttl <duration>` | `5m` | Evicts a session's state if no update arrives within this window |
-| `--config <path>` | `$XDG_CONFIG_HOME/ledstatus/config.json` | JSON config file path |
+| `--tcp-addr <host:port>` | *(disabled)* | Optional **unauthenticated** TCP listener. e.g. `:9876`. Mutually exclusive with `--forward-to`. |
+| `--forward-to <addr>` | *(disabled)* | Run in forwarder mode instead of driving the LED; relays local messages to a remote `ledstatusd`. Accepts `tcp://host:port`, `host:port`, or `unix:///path`. |
+| `--ttl <duration>` | `5m` | Evicts a session's state if no update arrives within this window. Applies only to sessions without a local PID (remote/TCP clients, manual CLI calls); PID-tracked sessions are evicted the moment Claude exits. |
+| `--config <path>` | `$XDG_CONFIG_HOME/ledstatus/config.json` | JSON config file path. Ignored in forwarder mode. |
 
 Environment:
 
@@ -161,13 +164,27 @@ systemctl --user daemon-reload
 systemctl --user restart ledstatusd
 ```
 
-On each client machine, set the CLI address before starting Claude:
+> The TCP listener has **no authentication**. Only bind it on trusted networks.
+
+### Client hosts: the forwarder (recommended)
+
+On each client machine, run a second `ledstatusd` in forwarder mode. It listens on a local Unix socket like a normal daemon, but doesn't touch any hardware — instead it relays each message to the remote server and, while Claude's PID is alive, pumps a keepalive to the remote once a minute so the remote's TTL never expires a live session. When Claude exits, the forwarder notices and sends `off`.
+
+```sh
+ledstatusd --forward-to tcp://<host>:9876 --socket=$XDG_RUNTIME_DIR/ledstatus.sock
+```
+
+Hooks just talk to the local socket as usual — no `LEDSTATUS_ADDR` needed. Drop a systemd user unit similar to `systemd/ledstatusd.service` but with `--forward-to` on the `ExecStart=` line.
+
+### Client hosts: direct TCP (no local daemon)
+
+If a local forwarder is inconvenient (one-off machine, ephemeral VM, etc.), the `ledstatus` CLI can still dial the remote `ledstatusd` directly:
 
 ```sh
 export LEDSTATUS_ADDR=tcp://<host>:9876
 ```
 
-> The TCP listener has **no authentication**. Only bind it on trusted networks.
+Tradeoff: the remote can't watch the client's PIDs, so sessions are reaped by the remote's TTL (default 5m) rather than exactly on process exit. Fine for Claude sessions that reliably fire `SessionEnd`; mildly lossy for ones that don't.
 
 ---
 
@@ -201,11 +218,13 @@ systemctl --user stop ledstatusd
 Project layout:
 
 ```
-cmd/ledstatusd/        daemon entrypoint
+cmd/ledstatusd/        daemon entrypoint (server + forwarder modes)
 cmd/ledstatus/         CLI entrypoint
 internal/luxafor/      hidraw discovery + HID writes
 internal/protocol/     wire types + state priority
-internal/server/       listeners, session tracker, animator
+internal/server/       listeners, session tracker, PID watcher, animator
+internal/forwarder/    forwarder mode: relay + keepalive to a remote daemon
+internal/procwatch/    /proc helpers: pid liveness, ppid walk, env probe
 internal/config/       JSON config loader
 udev/                  udev rule (installed by `make install-udev`)
 systemd/               user unit (installed by `make install-user-systemd`)

@@ -17,6 +17,7 @@ import (
 
 	"github.com/bmurray/ledstatus/internal/config"
 	"github.com/bmurray/ledstatus/internal/luxafor"
+	"github.com/bmurray/ledstatus/internal/procwatch"
 	"github.com/bmurray/ledstatus/internal/protocol"
 )
 
@@ -31,6 +32,16 @@ type session struct {
 	state    protocol.State
 	cwd      string
 	lastSeen time.Time
+
+	// pid / pidStart identify a local Claude process to watch for liveness.
+	// When pid > 0 the session is evicted by watchPID on process exit, not
+	// by the TTL check in winning(). Zero means "no local PID" — fall back
+	// to TTL reaping (remote/TCP clients, manual CLI use, etc.).
+	pid      int
+	pidStart string
+	// watchStop is closed to signal the current watcher to exit. Replaced
+	// whenever we start tracking a new (pid, pidStart) for this session.
+	watchStop chan struct{}
 }
 
 // Server owns the listeners, the session map, and the animator's device handle.
@@ -51,6 +62,10 @@ type Server struct {
 
 	// device is owned by the animator goroutine only.
 	device *luxafor.Device
+
+	// ctx is the server's lifecycle context. Set in Run(); read by
+	// PID-watcher goroutines so they exit on shutdown.
+	ctx context.Context
 }
 
 func New(cfg Config, log *slog.Logger) *Server {
@@ -82,6 +97,7 @@ func (s *Server) SetAnimConfig(c *config.Config) {
 
 // Run starts listeners and the animator. Returns when ctx is done.
 func (s *Server) Run(ctx context.Context) error {
+	s.ctx = ctx
 	_ = os.Remove(s.cfg.UnixPath) // clear stale socket from previous run
 
 	unixLn, err := net.Listen("unix", s.cfg.UnixPath)
@@ -107,10 +123,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { defer wg.Done(); s.acceptLoop(ctx, unixLn) }()
+	go func() { defer wg.Done(); s.acceptLoop(ctx, unixLn, true) }()
 	if tcpLn != nil {
 		wg.Add(1)
-		go func() { defer wg.Done(); s.acceptLoop(ctx, tcpLn) }()
+		go func() { defer wg.Done(); s.acceptLoop(ctx, tcpLn, false) }()
 	}
 
 	s.runAnimator(ctx)
@@ -118,7 +134,7 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, isLocal bool) {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -132,11 +148,11 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 			s.log.Debug("accept", "err", err)
 			continue
 		}
-		go s.handleConn(c)
+		go s.handleConn(c, isLocal)
 	}
 }
 
-func (s *Server) handleConn(c net.Conn) {
+func (s *Server) handleConn(c net.Conn, isLocal bool) {
 	defer c.Close()
 	dec := json.NewDecoder(c)
 	for {
@@ -151,33 +167,63 @@ func (s *Server) handleConn(c net.Conn) {
 			s.log.Debug("msg missing claude_id")
 			continue
 		}
-		s.apply(msg)
+		s.apply(msg, isLocal)
 	}
 }
 
 // apply records a state update and kicks the animator.
-func (s *Server) apply(msg protocol.Message) {
+//
+// When isLocal is true and the message carries a ClaudePID, we start (or
+// refresh) a watchPID goroutine keyed on (pid, starttime). The session then
+// lives until the process exits, ignoring the TTL.
+func (s *Server) apply(msg protocol.Message, isLocal bool) {
 	s.mu.Lock()
 	switch msg.State {
 	case protocol.StateOff, "":
-		delete(s.sessions, msg.ClaudeID)
+		if sess, ok := s.sessions[msg.ClaudeID]; ok {
+			if sess.watchStop != nil {
+				close(sess.watchStop)
+			}
+			delete(s.sessions, msg.ClaudeID)
+		}
 	default:
-		s.sessions[msg.ClaudeID] = &session{
-			state:    msg.State,
-			cwd:      msg.Cwd,
-			lastSeen: time.Now(),
+		sess, ok := s.sessions[msg.ClaudeID]
+		if !ok {
+			sess = &session{}
+			s.sessions[msg.ClaudeID] = sess
+		}
+		sess.state = msg.State
+		sess.cwd = msg.Cwd
+		sess.lastSeen = time.Now()
+
+		if isLocal && msg.ClaudePID > 0 {
+			start, err := procwatch.StartTime(msg.ClaudePID)
+			if err != nil {
+				s.log.Debug("pid starttime read failed", "pid", msg.ClaudePID, "err", err)
+			} else if sess.pid != msg.ClaudePID || sess.pidStart != start {
+				if sess.watchStop != nil {
+					close(sess.watchStop)
+				}
+				sess.pid = msg.ClaudePID
+				sess.pidStart = start
+				stop := make(chan struct{})
+				sess.watchStop = stop
+				go s.watchPID(msg.ClaudeID, msg.ClaudePID, start, stop)
+			}
 		}
 	}
 	s.mu.Unlock()
-	s.log.Debug("apply", "claude", msg.ClaudeID, "state", msg.State)
+	s.log.Debug("apply", "claude", msg.ClaudeID, "state", msg.State,
+		"pid", msg.ClaudePID, "local", isLocal)
 	select {
 	case s.tick <- struct{}{}:
 	default:
 	}
 }
 
-// winning returns the highest-priority live state across all sessions,
-// evicting ones that have aged out.
+// winning returns the highest-priority live state across all sessions.
+// Sessions with pid == 0 are evicted on TTL expiry; sessions with pid > 0
+// are kept as long as watchPID hasn't removed them yet.
 func (s *Server) winning() protocol.State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -185,7 +231,7 @@ func (s *Server) winning() protocol.State {
 	best := protocol.StateOff
 	bestP := 0
 	for id, sess := range s.sessions {
-		if now.Sub(sess.lastSeen) > s.cfg.TTL {
+		if sess.pid == 0 && now.Sub(sess.lastSeen) > s.cfg.TTL {
 			delete(s.sessions, id)
 			continue
 		}
@@ -195,4 +241,35 @@ func (s *Server) winning() protocol.State {
 		}
 	}
 	return best
+}
+
+// watchPID polls /proc/<pid> every 2s and evicts the session when the
+// process exits or its start-time changes (indicating PID reuse). Exits on
+// server shutdown or when a newer watcher supersedes this one via stop.
+func (s *Server) watchPID(claudeID string, pid int, pidStart string, stop <-chan struct{}) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-t.C:
+			if procwatch.Alive(pid, pidStart) {
+				continue
+			}
+			s.mu.Lock()
+			if sess, ok := s.sessions[claudeID]; ok && sess.pid == pid && sess.pidStart == pidStart {
+				delete(s.sessions, claudeID)
+				s.log.Debug("session evicted: pid exited", "claude", claudeID, "pid", pid)
+			}
+			s.mu.Unlock()
+			select {
+			case s.tick <- struct{}{}:
+			default:
+			}
+			return
+		}
+	}
 }

@@ -4,6 +4,11 @@
 //
 // Connection failures are silent (logged to stderr, exit 0) so a down daemon
 // never breaks a Claude turn.
+//
+// When connecting to a local Unix-socket daemon, the CLI walks up its parent
+// process chain to find Claude's PID (identified by the CLAUDECODE=1 env
+// var) and includes it in the message. The local daemon uses that PID to
+// evict the session the instant Claude exits, bypassing the TTL.
 package main
 
 import (
@@ -18,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bmurray/ledstatus/internal/procwatch"
 	"github.com/bmurray/ledstatus/internal/protocol"
 )
 
@@ -38,6 +44,9 @@ states:
 environment:
   LEDSTATUS_ADDR   where to reach the daemon. Default $XDG_RUNTIME_DIR/ledstatus.sock.
                    Forms: /tmp/ledstatus.sock  unix:///path  tcp://host:port  host:port
+                   Prefer a local daemon (or a local ledstatusd --forward-to) so
+                   the daemon can do PID-based session liveness; TCP targets
+                   fall back to TTL-only reaping.
   CLAUDE_ID        override session id for 'set' and 'off'.
 `
 
@@ -82,13 +91,19 @@ func runHook(args []string) {
 	if id == "" {
 		id = fallbackID()
 	}
-	send(protocol.Message{ClaudeID: id, State: state, Cwd: hi.Cwd})
+	send(protocol.Message{
+		ClaudeID:  id,
+		State:     state,
+		Cwd:       hi.Cwd,
+		ClaudePID: findClaudePID(),
+	})
 }
 
 func runSet(args []string) {
 	fs := flag.NewFlagSet("set", flag.ExitOnError)
 	idFlag := fs.String("claude-id", os.Getenv("CLAUDE_ID"), "claude session id")
 	cwd := fs.String("cwd", "", "working directory tag (optional)")
+	pidFlag := fs.Int("pid", 0, "claude PID for local liveness tracking (0 = auto-discover)")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "ledstatus set: missing <state>")
@@ -98,7 +113,16 @@ func runSet(args []string) {
 	if id == "" {
 		id = fallbackID()
 	}
-	send(protocol.Message{ClaudeID: id, State: protocol.State(fs.Arg(0)), Cwd: *cwd})
+	pid := *pidFlag
+	if pid == 0 {
+		pid = findClaudePID()
+	}
+	send(protocol.Message{
+		ClaudeID:  id,
+		State:     protocol.State(fs.Arg(0)),
+		Cwd:       *cwd,
+		ClaudePID: pid,
+	})
 }
 
 func runOff(args []string) {
@@ -169,6 +193,33 @@ func parseAddr(s string) (network, target string) {
 		return "unix", s
 	}
 	return "tcp", s
+}
+
+// findClaudePID walks up the process tree looking for Claude. Claude sets
+// CLAUDECODE=1 in the env of every subprocess it spawns (but not in its
+// own env), so descendants of Claude have it and Claude itself does not.
+// The first ancestor that *doesn't* have CLAUDECODE=1 is therefore Claude.
+//
+// Returns 0 if the current process isn't under a Claude hook, or if the
+// walk ran off the top (rare: someone set CLAUDECODE=1 in their login
+// shell). The daemon falls back to TTL reaping in that case.
+func findClaudePID() int {
+	const want = "CLAUDECODE=1"
+	pid := os.Getpid()
+	if !procwatch.HasEnv(pid, want) {
+		return 0
+	}
+	for range 10 {
+		ppid := procwatch.PPid(pid)
+		if ppid <= 1 {
+			return 0
+		}
+		if !procwatch.HasEnv(ppid, want) {
+			return ppid
+		}
+		pid = ppid
+	}
+	return 0
 }
 
 // fallbackID builds a best-effort session id when none was provided — useful

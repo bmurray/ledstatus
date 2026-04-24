@@ -23,10 +23,17 @@ const (
 const DefaultTTL = 5 * time.Minute
 
 // Message is the wire frame: one JSON object per line.
+//
+// ClaudePID, when non-zero, identifies the Claude process on the sender's
+// host. It's authoritative only when the sender is on the same host as the
+// daemon (i.e. connected via Unix socket) — the daemon uses it to watch the
+// process for liveness and evict the session the moment Claude exits. On TCP
+// connections the field is ignored and sessions fall back to TTL reaping.
 type Message struct {
-	ClaudeID string `json:"claude_id"`
-	State    State  `json:"state"`
-	Cwd      string `json:"cwd,omitempty"`
+	ClaudeID  string `json:"claude_id"`
+	State     State  `json:"state"`
+	Cwd       string `json:"cwd,omitempty"`
+	ClaudePID int    `json:"claude_pid,omitempty"`
 }
 
 // Priority orders states so the most urgent signal wins when multiple Claudes
